@@ -19,8 +19,15 @@
 
 
 #if HAVE_CUDA == 1
+#ifdef __IS_HIP_COMPILE__
+#include <hip/hip_runtime_api.h>
+#include <hipblas/hipblas.h>
+
+#include "hipify.h"
+#else
 #include <cuda_runtime_api.h>
 #include <cublas_v2.h>
+#endif
 #endif
 
 #include <algorithm>
@@ -140,7 +147,9 @@ void CuBlockMatrix<Real>::SetCudaData() {
     size_t size = NumBlocks() * sizeof(CuBlockMatrixData);
     cu_data_ = static_cast<CuBlockMatrixData*>(
         CuDevice::Instantiate().Malloc(size));
-    CU_SAFE_CALL(cudaMemcpy(cu_data_, &(tmp_cu_data[0]), size, cudaMemcpyHostToDevice));
+    CU_SAFE_CALL(cudaMemcpyAsync(cu_data_, &(tmp_cu_data[0]), size, 
+                                 cudaMemcpyHostToDevice, cudaStreamPerThread));
+    CU_SAFE_CALL(cudaStreamSynchronize(cudaStreamPerThread));
     CuDevice::Instantiate().AccuProfile(__func__, tim);    
   }
 #endif

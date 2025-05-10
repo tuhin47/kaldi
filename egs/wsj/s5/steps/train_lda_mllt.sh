@@ -1,11 +1,11 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # Copyright 2012  Johns Hopkins University (Author: Daniel Povey)
 #
 # LDA+MLLT refers to the way we transform the features after computing
 # the MFCCs: we splice across several frames, reduce the dimension (to 40
 # by default) using Linear Discriminant Analysis), and then later estimate,
-# over multiple iterations, a diagonalizing transform known as MLLT or CTC.
+# over multiple iterations, a diagonalizing transform known as MLLT or STC.
 # See http://kaldi-asr.org/doc/transform.html for more explanation.
 #
 # Apache 2.0.
@@ -196,7 +196,7 @@ while [ $x -lt $num_iters ]; do
       $cmd JOB=1:$nj $dir/log/macc.$x.JOB.log \
         ali-to-post "ark:gunzip -c $dir/ali.JOB.gz|" ark:- \| \
         weight-silence-post 0.0 $silphonelist $dir/$x.mdl ark:- ark:- \| \
-        gmm-acc-mllt --rand-prune=$randprune  $dir/$x.mdl "$feats" ark:- $dir/$x.JOB.macc \
+        gmm-acc-mllt --rand-prune=$randprune  $dir/$x.mdl "$feats" ark,s,o,cs:- $dir/$x.JOB.macc \
         || exit 1;
       est-mllt $dir/$x.mat.new $dir/$x.*.macc 2> $dir/log/mupdate.$x.log || exit 1;
       gmm-transform-means  $dir/$x.mat.new $dir/$x.mdl $dir/$x.mdl \

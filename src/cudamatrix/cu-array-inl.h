@@ -28,7 +28,13 @@
 #include <algorithm>
 
 #if HAVE_CUDA == 1
+#ifdef __IS_HIP_COMPILE__
+#include <hip/hip_runtime_api.h>
+
+#include "hipify.h"
+#else
 #include <cuda_runtime_api.h>
+#endif
 #include "cudamatrix/cu-common.h"
 #include "cudamatrix/cu-device.h"
 #include "cudamatrix/cu-kernels.h"
@@ -105,8 +111,9 @@ void CuArrayBase<T>::CopyFromVec(const std::vector<T> &src) {
   if (CuDevice::Instantiate().Enabled()) {
     CuTimer tim;
     CU_SAFE_CALL(
-        cudaMemcpy(data_, &src.front(), src.size() * sizeof(T),
-                   cudaMemcpyHostToDevice));
+        cudaMemcpyAsync(data_, &src.front(), src.size() * sizeof(T),
+                   cudaMemcpyHostToDevice, cudaStreamPerThread));
+    CU_SAFE_CALL(cudaStreamSynchronize(cudaStreamPerThread));
     CuDevice::Instantiate().AccuProfile(__func__, tim);
   } else
 #endif
@@ -122,7 +129,9 @@ void CuArray<T>::CopyFromVec(const std::vector<T> &src) {
 #if HAVE_CUDA == 1
   if (CuDevice::Instantiate().Enabled()) {
     CuTimer tim;
-    CU_SAFE_CALL(cudaMemcpy(this->data_, &src.front(), src.size()*sizeof(T), cudaMemcpyHostToDevice));
+    CU_SAFE_CALL(cudaMemcpyAsync(this->data_, &src.front(), 
+          src.size()*sizeof(T), cudaMemcpyHostToDevice, cudaStreamPerThread));
+    CU_SAFE_CALL(cudaStreamSynchronize(cudaStreamPerThread));
     CuDevice::Instantiate().AccuProfile(__func__, tim);
   } else
 #endif
@@ -139,8 +148,9 @@ void CuArray<T>::CopyFromArray(const CuArrayBase<T> &src) {
 #if HAVE_CUDA == 1
   if (CuDevice::Instantiate().Enabled()) {
     CuTimer tim;
-    CU_SAFE_CALL(cudaMemcpy(this->data_, src.data_, this->dim_ * sizeof(T),
-                            cudaMemcpyDeviceToDevice));
+    CU_SAFE_CALL(cudaMemcpyAsync(this->data_, src.data_, this->dim_ * sizeof(T),
+                                 cudaMemcpyDeviceToDevice,
+                                 cudaStreamPerThread));
     CuDevice::Instantiate().AccuProfile(__func__, tim);
   } else
 #endif
@@ -158,8 +168,8 @@ void CuArrayBase<T>::CopyFromArray(const CuArrayBase<T> &src) {
   if (CuDevice::Instantiate().Enabled()) {
     CuTimer tim;
     CU_SAFE_CALL(
-        cudaMemcpy(this->data_, src.data_, dim_ * sizeof(T),
-                   cudaMemcpyDeviceToDevice));
+      cudaMemcpyAsync(this->data_, src.data_, dim_ * sizeof(T),
+                      cudaMemcpyDeviceToDevice, cudaStreamPerThread));
     CuDevice::Instantiate().AccuProfile(__func__, tim);
   } else
 #endif
@@ -178,7 +188,9 @@ void CuArrayBase<T>::CopyToVec(std::vector<T> *dst) const {
 #if HAVE_CUDA == 1
   if (CuDevice::Instantiate().Enabled()) {
     CuTimer tim;
-    CU_SAFE_CALL(cudaMemcpy(&dst->front(), Data(), this->dim_ * sizeof(T), cudaMemcpyDeviceToHost));
+    CU_SAFE_CALL(cudaMemcpyAsync(&dst->front(), Data(), this->dim_ * sizeof(T),
+          cudaMemcpyDeviceToHost, cudaStreamPerThread));
+    CU_SAFE_CALL(cudaStreamSynchronize(cudaStreamPerThread));
     CuDevice::Instantiate().AccuProfile("CuArray::CopyToVecD2H", tim);
   } else
 #endif
@@ -195,7 +207,9 @@ void CuArrayBase<T>::CopyToHost(T *dst) const {
 #if HAVE_CUDA == 1
   if (CuDevice::Instantiate().Enabled()) {
     CuTimer tim;
-    CU_SAFE_CALL(cudaMemcpy(dst, Data(), this->dim_ * sizeof(T), cudaMemcpyDeviceToHost));
+    CU_SAFE_CALL(cudaMemcpyAsync(dst, Data(), this->dim_ * sizeof(T),
+          cudaMemcpyDeviceToHost, cudaStreamPerThread));
+    CU_SAFE_CALL(cudaStreamSynchronize(cudaStreamPerThread));
     CuDevice::Instantiate().AccuProfile("CuArray::CopyToVecD2H", tim);
   } else
 #endif
@@ -211,7 +225,8 @@ void CuArrayBase<T>::SetZero() {
 #if HAVE_CUDA == 1
   if (CuDevice::Instantiate().Enabled()) {
     CuTimer tim;
-    CU_SAFE_CALL(cudaMemset(this->data_, 0, this->dim_ * sizeof(T)));
+    CU_SAFE_CALL(cudaMemsetAsync(this->data_, 0, this->dim_ * sizeof(T),
+          cudaStreamPerThread));
     CuDevice::Instantiate().AccuProfile("CuArray::SetZero", tim);
   } else
 #endif

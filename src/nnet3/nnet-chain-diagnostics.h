@@ -37,9 +37,11 @@ struct ChainObjectiveInfo {
   double tot_weight;
   double tot_like;
   double tot_l2_term;
+  double tot_lwf_term;
   ChainObjectiveInfo(): tot_weight(0.0),
                         tot_like(0.0),
-                        tot_l2_term(0.0) { }
+                        tot_l2_term(0.0),
+                        tot_lwf_term(0.0) { }
 };
 
 
@@ -82,6 +84,11 @@ class NnetChainComputeProb {
   // returns the objective-function info for this output name (e.g. "output"),
   // or NULL if there is no such info.
   const ChainObjectiveInfo *GetObjective(const std::string &output_name) const;
+
+  // This function returns the total objective over all output nodes recorded here, and
+  // outputs to 'tot_weight' the total weight (typically the number of frames)
+  // corresponding to it.
+  double GetTotalObjective(double *tot_weight) const;
 
   // if config.compute_deriv == true, returns a reference to the
   // computed derivative.  Otherwise crashes.

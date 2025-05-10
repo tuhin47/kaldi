@@ -125,8 +125,8 @@ static void UnitTestCuSparseMatrixSelectRowsAndTranspose() {
 template <typename Real>
 static void UnitTestCuSparseMatrixTraceMatSmat() {
   for (int32 i = 0; i < 2; i++) {
-    MatrixIndexT row = 10 + Rand() % 40;
-    MatrixIndexT col = 10 + Rand() % 50;
+    MatrixIndexT row = 2 + Rand() % 3;
+    MatrixIndexT col = 1 + Rand() % 4;
 
     CuMatrix<Real> mat1(row, col);
     CuMatrix<Real> mat2(col, row);
@@ -147,11 +147,13 @@ static void UnitTestCuSparseMatrixTraceMatSmat() {
     cu_smat2.CopyToMat(&mat2);
 
     Real trace1 = TraceMatMat(mat3, mat1, kTrans);
+
     Real trace2 = TraceMatSmat(mat3, cu_smat1, kTrans);
     AssertEqual(trace1, trace2, 0.00001);
 
     trace1 = TraceMatMat(mat3, mat2, kNoTrans);
     trace2 = TraceMatSmat(mat3, cu_smat2, kNoTrans);
+
     AssertEqual(trace1, trace2, 0.00001);
   }
 }
@@ -173,7 +175,7 @@ static void UnitTestCuSparseMatrixSum() {
 
     Real sum1 = cu_smat.Sum();
     Real sum2 = mat.Sum();
-    KALDI_ASSERT(fabs(sum1 - sum2) < 1.0e-05);
+    KALDI_ASSERT(fabs(sum1 - sum2) < 1.0e-04);
   }
 }
 

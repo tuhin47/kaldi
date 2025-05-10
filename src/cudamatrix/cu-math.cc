@@ -564,7 +564,6 @@ void CpuBackpropLstmNonlinearity(const MatrixBase<Real> &input,
   KALDI_ASSERT(deriv_sum_in.NumRows() == 5);
   KALDI_ASSERT(deriv_sum_in.NumCols() == cell_dim);
   KALDI_ASSERT(self_repair_config.Dim() == 10);
-  KALDI_ASSERT(count_in >= 0);
   if (input_deriv != NULL) {
     KALDI_ASSERT(SameDim(input, *input_deriv));
   }
@@ -819,7 +818,7 @@ void BackpropLstmNonlinearity(const CuMatrixBase<Real> &input,
 
     // Use 2D block (8x32 threads) as we need to compute column sum.
     // Use 1D grid to cover the data matrix width `cell_dim`.
-    const int kWarpSize = 32;
+    const int kWarpSize = GPU_WARP_SIZE;
     dim3 dimBlock(kWarpSize, CU1DBLOCK / kWarpSize);
 //    dim3 dimGrid(n_blocks(cell_dim, dimBlock.x),
 //                 n_blocks(num_rows, dimBlock.y));

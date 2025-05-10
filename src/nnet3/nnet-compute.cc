@@ -1,6 +1,7 @@
 // nnet3/nnet-compute.cc
 
 // Copyright      2015  Johns Hopkins University (author: Daniel Povey)
+//                2020-2021  Xiaomi Corporation (Author: Zhao Yan)
 
 // See ../../COPYING for clarification regarding multiple authors
 //
@@ -30,22 +31,62 @@ NnetComputer::NnetComputer(const NnetComputeOptions &options,
                            const Nnet &nnet,
                            Nnet *nnet_to_update):
     options_(options), computation_(computation), nnet_(nnet),
-    program_counter_(0), nnet_to_update_(nnet_to_update) {
-  KALDI_ASSERT(computation.indexes_cuda.size() == computation.indexes.size() &&
- computation.indexes_ranges_cuda.size() == computation.indexes_ranges.size() &&
+    program_counter_(0), nnet_to_store_stats_(nnet_to_update),
+    nnet_to_update_(nnet_to_update) {
+  Init();
+}
+
+NnetComputer::NnetComputer(const NnetComputeOptions &options,
+                           const NnetComputation &computation,
+                           const Nnet &nnet,
+                           Nnet *nnet_to_update,
+                           NnetComputerSnapshot *snapshot):
+    options_(options), computation_(computation), nnet_(nnet),
+    program_counter_(0), nnet_to_store_stats_(nnet_to_update),
+    nnet_to_update_(nnet_to_update) {
+  Init();
+  
+  if (snapshot) {
+    program_counter_ = snapshot->program_counter;
+    pending_commands_ = snapshot->pending_commands;
+    memos_ = snapshot->memos;
+    KALDI_ASSERT(matrices_.size() == snapshot->num_rows_of_matrices.size());
+    KALDI_ASSERT(matrices_.size() == snapshot->num_cols_of_matrices.size());
+
+    for (std::size_t i = 0; i < matrices_.size(); i++) {
+      matrices_[i].Resize(snapshot->num_rows_of_matrices[i],
+                          snapshot->num_cols_of_matrices[i],
+                          kUndefined);
+    }
+  }
+}
+
+NnetComputer::NnetComputer(const NnetComputeOptions &options,
+                           const NnetComputation &computation,
+                           Nnet *nnet,
+                           Nnet *nnet_to_update):
+    options_(options), computation_(computation), nnet_(*nnet),
+    program_counter_(0), nnet_to_store_stats_(nnet),
+    nnet_to_update_(nnet_to_update) {
+  Init();
+}
+
+void NnetComputer::Init() {
+  KALDI_ASSERT(computation_.indexes_cuda.size() == computation_.indexes.size() &&
+ computation_.indexes_ranges_cuda.size() == computation_.indexes_ranges.size() &&
                "You must call NnetComputation::ComputeCudaIndexes() before "
                "executing the computation.");
-  matrices_.resize(computation.matrices.size());
+  matrices_.resize(computation_.matrices.size());
   debug_ = (options_.debug || GetVerboseLevel() >= 5);
   if (debug_) {
     ComputationVariables variables;
-    variables.Init(computation);
-    ComputeCommandAttributes(nnet, computation, variables,
+    variables.Init(computation_);
+    ComputeCommandAttributes(nnet_, computation_, variables,
                              &command_attributes_);
     std::string preamble;
-    computation.GetCommandStrings(nnet, &preamble, &command_strings_);
+    computation_.GetCommandStrings(nnet_, &preamble, &command_strings_);
     KALDI_LOG << preamble;
-    computation.GetSubmatrixStrings(nnet, &submatrix_strings_);
+    computation_.GetSubmatrixStrings(nnet_, &submatrix_strings_);
   }
 }
 
@@ -177,6 +218,7 @@ NnetComputer::NnetComputer(const NnetComputer &other):
     nnet_(other.nnet_),
     program_counter_(other.program_counter_),
     pending_commands_(other.pending_commands_),
+    nnet_to_store_stats_(other.nnet_to_store_stats_),
     nnet_to_update_(other.nnet_to_update_),
     debug_(other.debug_),
     command_attributes_(other.command_attributes_),
@@ -219,6 +261,7 @@ void NnetComputer::ExecuteCommand() {
         break;
       }
       case kPropagate: {
+        NVTX_RANGE("NnetComputer::ExecuteCommand::kPropagate");
         const Component *component = nnet_.GetComponent(c.arg1);
         ComponentPrecomputedIndexes *indexes =
             computation_.component_precomputed_indexes[c.arg2].data;
@@ -226,30 +269,41 @@ void NnetComputer::ExecuteCommand() {
         CuSubMatrix<BaseFloat> output(GetSubMatrix(c.arg4));
         void *memo = component->Propagate(indexes, input, &output);
         if (c.arg6) {  // need to store stats.
-          KALDI_ASSERT(nnet_to_update_ != NULL);
-          Component *upd_component = nnet_to_update_->GetComponent(c.arg1);
+          KALDI_ASSERT(nnet_to_store_stats_ != NULL);
+          Component *stats_component = nnet_to_store_stats_->GetComponent(c.arg1);
           bool was_in_place = (c.arg3 == c.arg4);
           // if propagate was in-place, provide empty matrix and not 'input', as
           // input is no longer valid.
           const CuSubMatrix<BaseFloat> maybe_input(
               GetSubMatrix(was_in_place ? 0 : c.arg3));
-          upd_component->StoreStats(maybe_input, output, memo);
+          stats_component->StoreStats(maybe_input, output, memo);
         }
         SaveMemo(c.arg5, *component, memo);
         break;
       }
       case kBackprop:
       case kBackpropNoModelUpdate:  {
+        NVTX_RANGE("NnetComputer::ExecuteCommand::kBackpropNoModelUpdate");
         std::ostringstream debug_str;
         KALDI_ASSERT(nnet_to_update_ != NULL);
         debug_str << nnet_.GetComponentName(c.arg1);
         const Component *component = nnet_.GetComponent(c.arg1);
         KALDI_ASSERT(!(computation_.need_model_derivative && !nnet_to_update_));
-        Component *upd_component = (nnet_to_update_ &&
-                                    c.command_type == kBackprop &&
-                                    computation_.need_model_derivative ?
-                                    nnet_to_update_->GetComponent(c.arg1) :
-                                    NULL);
+        Component *upd_component = NULL;
+        if (c.command_type == kBackprop) {  // this block sets 'upd_component'
+          Nnet *nnet_to_update;
+          if (component->Properties()&kUpdatableComponent) {
+            nnet_to_update = (computation_.need_model_derivative ?
+                              nnet_to_update_ : NULL);
+          } else {
+            // Some non-updatable components, such as CompositeComponent, store
+            // stats in the backprop.  For other types of non-updatable
+            // component, this arg won't matter.
+            nnet_to_update = nnet_to_store_stats_;
+          }
+          if (nnet_to_update)
+            upd_component = nnet_to_update->GetComponent(c.arg1);
+        }
         ComponentPrecomputedIndexes *indexes =
             computation_.component_precomputed_indexes[c.arg2].data;
         const CuSubMatrix<BaseFloat> in_value(GetSubMatrix(c.arg3));
@@ -356,6 +410,43 @@ void NnetComputer::ExecuteCommand() {
         }
         break;
       }
+      case kCompressMatrix:
+        // This does nothing if CUDA is not in use.
+#if HAVE_CUDA == 1
+        if (CuDevice::Instantiate().Enabled()) {
+          if (compressed_matrices_.empty())
+            compressed_matrices_.resize(matrices_.size(), NULL);
+          int32 m = computation_.submatrices[c.arg1].matrix_index;
+          KALDI_ASSERT(compressed_matrices_[m] == NULL &&
+                       matrices_[m].NumRows() != 0);
+          BaseFloat range = c.alpha;
+          bool truncate = (c.arg3 != 0);
+          compressed_matrices_[m] = NewCuCompressedMatrix(
+              static_cast<CuCompressedMatrixType>(c.arg2),
+              range, truncate);
+          compressed_matrices_[m]->CopyFromMat(matrices_[m]);
+          matrices_[m].Resize(0, 0);
+        }
+#endif
+        break;
+      case kDecompressMatrix:
+#if HAVE_CUDA == 1
+        if (CuDevice::Instantiate().Enabled()) {
+          int32 m = computation_.submatrices[c.arg1].matrix_index;
+          CuCompressedMatrixBase *compressed_matrix =
+              compressed_matrices_[m];
+          KALDI_ASSERT(compressed_matrix != NULL &&
+                       matrices_[m].NumRows() == 0);
+          matrices_[m].Resize(compressed_matrix->NumRows(),
+                              compressed_matrix->NumCols(),
+                              kUndefined,
+                              computation_.matrices[m].stride_type);
+          compressed_matrix->CopyToMat(&(matrices_[m]));
+          delete compressed_matrix;
+          compressed_matrices_[m] = NULL;
+        }
+#endif
+        break;
       case kNoOperation: case kNoOperationPermanent: case kNoOperationMarker:
       case kNoOperationLabel:
         break;
@@ -428,8 +519,10 @@ void NnetComputer::GetPointers(int32 indexes_multi_index,
   for (int32 i = 0; i < size; i += 30 + RandInt(0, 9)) {
     // Do a pseudo-random spot check that the row-indexes are not out of range.
     int32 submatrix_index = pairs[i].first, row = pairs[i].second;
-    CuSubMatrix<BaseFloat> m = GetSubMatrix(submatrix_index);
-    KALDI_ASSERT(row >= 0 && row < m.NumRows() && num_cols == m.NumCols());
+    if (submatrix_index != -1) {
+      CuSubMatrix<BaseFloat> m = GetSubMatrix(submatrix_index);
+      KALDI_ASSERT(row >= 0 && row < m.NumRows() && num_cols == m.NumCols());
+    }
   }
 #endif
   pointers->CopyFromVec(vec);
@@ -443,6 +536,7 @@ void NnetComputer::GetPointers(int32 indexes_multi_index,
 }
 
 void NnetComputer::Run() {
+  NVTX_RANGE(__func__);
   const std::vector<NnetComputation::Command> &c = computation_.commands;
   int32 num_commands = c.size();
 
@@ -596,6 +690,8 @@ void NnetComputer::AcceptInputs(const Nnet &nnet,
                                 const std::vector<NnetIo> &io_vec) {
   for (size_t i = 0; i < io_vec.size(); i++) {
     const NnetIo &io = io_vec[i];
+    if (io.name.substr(0, 2) == "__")   // It's non-compute input data, e.g. for LWF
+      continue;
     int32 node_index = nnet.GetNodeIndex(io.name);
     if (node_index == -1)
       KALDI_ERR << "No node named '" << io.name << "' in nnet.";
@@ -606,6 +702,210 @@ void NnetComputer::AcceptInputs(const Nnet &nnet,
       cu_input.CopyFromGeneralMat(io.features);
       this->AcceptInput(io.name, &cu_input);
     }
+  }
+}
+
+NnetComputer::~NnetComputer() {
+  // Delete any pointers that are present in compressed_matrices_.  Actually
+  // they should all already have been deallocated and set to NULL if the
+  // compuation was run to completion; we do this in case someone ran
+  // the forward propagation but not the backprop.
+  for (size_t i = 0; i < compressed_matrices_.size(); i++)
+    delete compressed_matrices_[i];
+}
+
+bool NnetComputer::Equal(const NnetComputer &other) {
+  if (program_counter_ != other.program_counter_)
+    return false;
+
+  if (pending_commands_ != other.pending_commands_)
+    return false;
+
+  if (memos_.size() != other.memos_.size())
+    return false;
+
+  if (compressed_matrices_.size() != other.compressed_matrices_.size())
+    return false;
+
+  if (matrices_.size() != other.matrices_.size())
+    return false;
+
+  for (std::size_t i = 0; i < matrices_.size(); i++) {
+    if (matrices_[i].NumRows() != other.matrices_[i].NumRows())
+      return false;
+
+    if (matrices_[i].NumCols() != other.matrices_[i].NumCols())
+      return false;
+  }
+  
+  return true;
+}
+
+void NnetComputer::GetState(const std::vector<bool> &batch_first,
+                            const int32 batch_size,
+                            std::vector< NnetComputeState* > *state) {
+  KALDI_ASSERT(state->size() <= batch_size);
+  std::vector< const CuMatrix<BaseFloat>* > valid_matrices;
+
+  for (std::size_t i = 0; i < matrices_.size(); i++) {
+    if (matrices_[i].NumRows() > 0 && matrices_[i].NumCols() > 0)
+      valid_matrices.push_back(&matrices_[i]);
+  }
+
+  if (batch_first.size() != valid_matrices.size())
+    KALDI_ERR << "The size of vector which represents batch first or not is " 
+              << batch_first.size()
+              << " , and it is't compatible with NnetComputer's matrices,"
+              << " which expect " << valid_matrices.size();
+
+  for (std::size_t stream = 0; stream < state->size(); stream++) {
+    NnetComputeState *stream_state = (*state)[stream];
+    if (stream_state->matrices.size() == 0)
+      stream_state->matrices.resize(valid_matrices.size());
+    
+    if (stream_state->matrices.size() != valid_matrices.size())
+      KALDI_ERR << "Some stream's state is't compatible with "
+                << "NnetComputer's matrices!";
+  }
+
+  for (std::size_t i = 0; i < valid_matrices.size(); i++) {
+    const CuMatrix<BaseFloat> &src = *valid_matrices[i];
+    std::vector< BaseFloat* > dst(src.NumRows(), NULL);
+    KALDI_ASSERT(src.NumRows() % batch_size == 0);
+    int32 stream_num_rows = src.NumRows() / batch_size;
+    int32 stream_num_cols = src.NumCols();
+
+    for (std::size_t stream = 0; stream < state->size(); stream++) {
+      CuMatrix<BaseFloat> &stream_matrix = (*state)[stream]->matrices[i];
+      
+      if (stream_matrix.NumRows() != stream_num_rows 
+          || stream_matrix.NumCols() != stream_num_cols)
+        stream_matrix.Resize(stream_num_rows, stream_num_cols, 
+                             kUndefined, kStrideEqualNumCols);
+
+      if (batch_first[i]) {
+        int32 offset = stream * stream_num_rows;
+        for (int32 j = 0; j < stream_num_rows; j++)
+          dst[offset + j] = stream_matrix.RowData(j);
+      } else {
+        int32 offset = stream;
+        for (int32 j = 0; j < stream_num_rows; j++)
+          dst[offset + j * batch_size] = stream_matrix.RowData(j);
+      }
+    }
+
+    src.CopyToRows(CuArray<BaseFloat *>(dst));
+  }
+}
+
+void NnetComputer::SetState(const std::vector<bool> &batch_first,
+                            const int32 batch_size,
+                            const std::vector< NnetComputeState* > &state) {
+  KALDI_ASSERT(state.size() <= batch_size);
+  std::vector< CuMatrix<BaseFloat>* > valid_matrices;
+
+  for (std::size_t i = 0; i < matrices_.size(); i++) {
+    if (matrices_[i].NumRows() > 0 && matrices_[i].NumCols() > 0)
+      valid_matrices.push_back(&matrices_[i]);
+  }
+
+  if (batch_first.size() != valid_matrices.size())
+    KALDI_ERR << "The size of vector which represents batch first or not is " 
+              << batch_first.size()
+              << " , and it is't compatible with NnetComputer's matrices,"
+              << " which expect " << valid_matrices.size();
+  
+  for (std::size_t stream = 0; stream < state.size(); stream++) {
+    NnetComputeState *stream_state = state[stream];
+    if (stream_state->matrices.size() != valid_matrices.size())
+      KALDI_ERR << "Some stream's state is't compatible with "
+                << "NnetComputer's matrices!";
+  }
+  
+  for (std::size_t i = 0; i < valid_matrices.size(); i++) {
+    CuMatrix<BaseFloat> &dst = *valid_matrices[i];
+    std::vector< const BaseFloat* > src(dst.NumRows(), NULL);
+    KALDI_ASSERT(dst.NumRows() % batch_size == 0);
+    int32 stream_num_rows = dst.NumRows() / batch_size;
+    int32 stream_num_cols = dst.NumCols();
+
+    for (std::size_t stream = 0; stream < state.size(); stream++) {
+      CuMatrix<BaseFloat> &stream_matrix = state[stream]->matrices[i];
+
+      if (stream_num_rows == stream_matrix.NumRows() 
+          && stream_num_cols == stream_matrix.NumCols()) {
+        // just copy the data if size matched completely. 
+        // e.g. cell state of LSTM.
+        if (batch_first[i]) {
+          for (int32 j = 0; j < stream_num_rows; j++)
+            src[stream * stream_num_rows + j] = stream_matrix.RowData(j);
+        } else {
+          for (int32 j = 0; j < stream_num_rows; j++)
+            src[stream + j * batch_size] = stream_matrix.RowData(j);
+        }
+      } else if (stream_num_rows < stream_matrix.NumRows()
+          && stream_num_cols == stream_matrix.NumCols()) {
+        // copy the recent parts of the data if less frames. 
+        // e.g. the inputs cached by 1st chunk are more the other chunks,
+        // so just copy the recent parts to the 2nd chunk.
+        int32 offset = stream_matrix.NumRows() - stream_num_rows;
+        if (batch_first[i]) {
+          for (int32 j = 0; j < stream_num_rows; j++)
+            src[stream * stream_num_rows + j] = stream_matrix.RowData(offset + j);
+        } else {
+          for (int32 j = 0; j < stream_num_rows; j++)
+            src[stream + j * batch_size] = stream_matrix.RowData(offset + j);
+        }
+      } else if(stream_num_rows < stream_matrix.NumRows()
+          && stream_num_cols % stream_matrix.NumCols() == 0) {
+        // copy data in overlapped windows if dimension changed.
+        // e.g. the data's dimensions cached by TDNN are changed between 
+        // 1st chunk and 2nd chunk
+        int32 multiple = stream_num_cols / stream_matrix.NumCols();
+        int32 offset = stream_matrix.NumRows() - stream_num_rows - (multiple - 1);
+        KALDI_ASSERT(stream_matrix.NumCols() == stream_matrix.Stride());
+        KALDI_ASSERT(offset >= 0);
+        if (batch_first[i]) {
+          for (int32 j = 0; j < stream_num_rows; j++) 
+            src[stream * stream_num_rows + j] = stream_matrix.RowData(offset + j);
+        } else {
+          for (int32 j = 0; j < stream_num_rows; j++)
+            src[stream + j * batch_size] = stream_matrix.RowData(offset + j);
+        }
+      } else {
+        KALDI_ERR << "Some stream's state is't compatible with "
+                  << "NnetComputer's matrices!";
+      }
+    }
+
+    dst.CopyRows(CuArray<const BaseFloat *>(src));
+  }
+}
+
+
+void NnetComputer::Print(std::ostream &os) {
+  os << "matrixs:";
+  for (std::size_t i = 0; i < matrices_.size(); i++) {
+    if (matrices_[i].NumRows() > 0 && matrices_[i].NumCols() > 0) {
+      os << "  [" << matrices_[i].NumRows() << ", " 
+         << matrices_[i].NumCols() << "]";
+    }
+  }
+  os << "\n";
+}
+
+void NnetComputer::GetSnapshot(NnetComputerSnapshot *snapshot) const {
+  if (NULL == snapshot) return;
+
+  snapshot->program_counter = program_counter_;
+  snapshot->pending_commands = pending_commands_;
+  snapshot->memos = memos_;
+  snapshot->num_rows_of_matrices.clear();
+  snapshot->num_cols_of_matrices.clear();
+
+  for (std::size_t i = 0; i < matrices_.size(); i++) {
+    snapshot->num_rows_of_matrices.push_back(matrices_[i].NumRows());
+    snapshot->num_cols_of_matrices.push_back(matrices_[i].NumCols());
   }
 }
 

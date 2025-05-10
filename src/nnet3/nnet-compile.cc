@@ -322,10 +322,23 @@ void Compiler::CreateStepInfo(
                                                  stride_type);
     } else {
       // kDimRange.  Will just be a sub-matrix of a Component or Input node.
-      int32 cindex_id = this_info.output_cindex_ids.front(),
-          input_cindex_id = graph_.dependencies[cindex_id][0],
-          input_step = cindex_id_to_location_[input_cindex_id].first;
-      KALDI_ASSERT(input_step != -1 && input_step < step);
+      std::vector<int32>::const_iterator
+          iter = this_info.output_cindex_ids.begin(),
+          end = this_info.output_cindex_ids.end();
+      int32 source_cindex_id = -1;
+      for (; iter != end; ++iter) {
+        int32 cindex_id = *iter;
+        if (!graph_.dependencies[cindex_id].empty()) {
+          KALDI_ASSERT(graph_.dependencies[cindex_id].size() == 1);
+          source_cindex_id = graph_.dependencies[cindex_id][0];
+          break;
+        }
+      }
+      KALDI_ASSERT(source_cindex_id >= 0);
+      int32 input_step = cindex_id_to_location_[source_cindex_id].first;
+      KALDI_ASSERT(this_info.output_cindex_ids.size() ==
+                   steps_[input_step].output_cindex_ids.size());
+      KALDI_ASSERT(input_step >= 0 && input_step < step);
       KALDI_PARANOID_ASSERT(this_info.output_indexes ==
                             steps_[input_step].output_indexes);
       this_info.value = computation->NewSubMatrix(steps_[input_step].value,
@@ -376,6 +389,8 @@ void Compiler::CreateStepInfo(
         KALDI_ASSERT(cur_dim_offset == desc.Dim(nnet_));
       }
     }
+    KALDI_ASSERT(static_cast<int32>(this_info.output_cindex_ids.size()) ==
+                 computation->submatrices[this_info.value].num_rows);
   }
 }
 
@@ -1346,6 +1361,15 @@ void Compiler::OutputDebugInfo(NnetComputation *computation) const {
     NnetComputation::MatrixDebugInfo &debug_info =
         computation->matrix_debug_info[value_matrix];
     debug_info.is_deriv = false;
+    if (!debug_info.cindexes.empty()) {
+      // This can happen if we created an alias for a node using a
+      // dim-range-node that covers all the dimensions (would satisfy
+      // IsWholeMatrix() above while not being a unique matrix).  We sometimes
+      // do that to work around compiler constraints when creating expressions
+      // that have the same quantity with more than one scaling value within the
+      // same expression (like for computing deltas).
+      continue;
+    }
     AppendCindexes(step_info.node_index, step_info.output_indexes,
                    &debug_info.cindexes);
     if (deriv_matrix != 0) {

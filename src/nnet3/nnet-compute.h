@@ -1,6 +1,7 @@
 // nnet3/nnet-compute.h
 
 // Copyright   2012-2015  Johns Hopkins University (author: Daniel Povey)
+//             2020-2021  Xiaomi Corporation (Author: Zhao Yan)
 
 // See ../../COPYING for clarification regarding multiple authors
 //
@@ -47,6 +48,34 @@ struct NnetComputeOptions {
 
 };
 
+// NnetComputeState stores computation state of Nnet.
+// The data stored in matrices are copied from NnetComputer, 
+// and will be copied to NnetComputer before next computation.
+// It's only needed for NnetBatchLoopedComputer.
+struct NnetComputeState {
+  std::vector< CuMatrix<BaseFloat> > matrices;
+};
+
+/*
+ * struct NnetComputerSnapshot contains information held by NnetComputer,
+ * except the data saved in matrices_.
+ *
+ * If the NnetComputerSnapshot is provided in constructor, the NnetComputer
+ * will restore from the snapshot, and all of matrix in matrices_ will be 
+ * resized with the size recorded by snapshot and kUndefined. So remember to 
+ * fill the matrices_ with correct data before call Run() of NnetComputer.
+ *
+ * Caution: the NnetComputerSnapshot is only used by NnetBatchLoopedComputer 
+ * now!!! The matrices_ are filled by state from difference streams per chunk
+ * before Run() is called.
+ */
+struct NnetComputerSnapshot {
+  int32 program_counter;
+  std::vector<int32> pending_commands;
+  std::vector<void*> memos;
+  std::vector<int32> num_rows_of_matrices;
+  std::vector<int32> num_cols_of_matrices;
+};
 
 /**
   class NnetComputer is responsible for executing the computation described in the
@@ -62,15 +91,37 @@ class NnetComputer {
   /// model update or model-derivative computation.
   /// You must call computation.ComputeCudaIndexes()  before calling
   /// this function.
+  ///
+  /// Caution: there is another constructor that takes a pointer for
+  /// 'nnet', be careful not to mix these up.
   NnetComputer(const NnetComputeOptions &options,
                const NnetComputation &computation,
                const Nnet &nnet,
                Nnet *nnet_to_update);
 
-  /// Copy constructor.  May not be used if memos are involved (memos are only
-  /// possible if backprop will take place, and in these situations you won't
-  /// normally be wanting to use the copy constructor anyway; the copy
-  /// constructor is more useful for things like RNNLM lattice rescoring).
+  /// Constructor, restore from the snapshot.
+  /// Fill the matrices_ with correct data before call Run().
+  NnetComputer(const NnetComputeOptions &options,
+               const NnetComputation &computation,
+               const Nnet &nnet,
+               Nnet *nnet_to_update,
+               NnetComputerSnapshot *snapshot);
+
+  /// This version of the constructor accepts a pointer to 'nnet' instead
+  /// of a const reference.  The difference is that this version will,
+  /// for storing statistics (the StoreStats() function of class Component),
+  /// use 'nnet' instead of 'nnet_to_update' (if specified).
+  NnetComputer(const NnetComputeOptions &options,
+               const NnetComputation &computation,
+               Nnet *nnet,
+               Nnet *nnet_to_update);
+
+
+  /// Copy constructor.  May not be used if memos are stored with this object
+  /// (which is only a possibility if backprop will take place, and in these
+  /// situations you won't normally be wanting to use the copy constructor
+  /// anyway; the copy constructor is more useful for things like RNNLM lattice
+  /// rescoring).
   NnetComputer(const NnetComputer &other);
 
   /// e.g. AcceptInput ("input", &input_mat), or for derivatives w.r.t. the
@@ -105,16 +156,59 @@ class NnetComputer {
 
   // Version of GetOutput that calls Swap(), destroying the output stored inside
   // this object.  You should probably not use this if you plan to call
-  // Backward() on the same NnetComputer object, or it's a recurret
+  // Backward() on the same NnetComputer object, or it's a recurrent
   // computation-- it may lead to a crash.
   void GetOutputDestructive(const std::string &output_name,
                             CuMatrix<BaseFloat> *output);
 
+  // Get the matrices where store the state for next computation
+  inline const std::vector< CuMatrix<BaseFloat> > &GetMatrices() const { 
+    return matrices_; }
 
+  // Copy the state of stream from NnetComputer to NnetComputeState,
+  // avoid being rewritten by next computation. 
+  // The parameter named "batch_first" indicates whether the matrices which 
+  // holding state in NnetComputer is batch first or not. The size of 
+  // "batch_first" must be equal to the number of matrices which are not empty
+  // in NnetComputer.
+  // The parameter named "batch_size" is the same as the batch size of 
+  // the NnetComputation. 
+  // The parameter named "state" stores state of streams.
+  void GetState(const std::vector<bool> &batch_first,
+                const int32 batch_size,
+                std::vector< NnetComputeState* > *state);
+  
+  // Copy the state of stream from NnetComputeState to NnetComputer, 
+  // filling matrices of NnetComputer with corresponding state of stream 
+  // before computation. 
+  // The parameter named "batch_first" indicates whether the matrices which 
+  // holding state in NnetComputer is batch first or not. The size of 
+  // "batch_first" must be equal to the number of matrices which are not empty
+  // in NnetComputer.
+  // The parameter named "batch_size" is the same as the batch size of 
+  // the NnetComputation. 
+  // The parameter named "state" stores state of streams.
+  void SetState(const std::vector<bool> &batch_first,
+                const int32 batch_size,
+                const std::vector< NnetComputeState* > &state);
+
+  // Return true if all the members are equal to other's.
+  bool Equal(const NnetComputer &other);
+
+  // Take a snapshot of the NnetComputer. 
+  // It save the size but not the data of matrices in NnetComputer.
+  void GetSnapshot(NnetComputerSnapshot *snapshot) const;
+
+  void Print(std::ostream &os);
+
+  ~NnetComputer();
  private:
+  void Init(); // called from constructors.
+
   const NnetComputeOptions &options_;
   const NnetComputation &computation_;
   const Nnet &nnet_;
+
   int32 program_counter_;  // command index to execute next.
   // To deal with inputs and outputs that are not provided/taken by the user in
   // the same order as listed in the computation, pending_commands_ contains a
@@ -122,6 +216,13 @@ class NnetComputer {
   // executed.
   std::vector<int32> pending_commands_;
 
+  // A pointer to the copy of the nnet which we'll be using for stats
+  // accumulation (the StoreStats() function).  May be NULL or the same
+  // as nnet_ or nnet_to_update_.
+  Nnet *nnet_to_store_stats_;
+  // A pointer to the copy of the nnet which we'll be updating the parameters
+  // of (nnet_to_update in the backprop function).  May be NULL and usually
+  // will not be the same as nnet_.
   Nnet *nnet_to_update_;
   bool debug_;
   // command_attributes_ is only used if debug_=true.
@@ -138,6 +239,14 @@ class NnetComputer {
   // Backprop() routines, indexed by memo-index (zeroth element always
   // NULL).
   std::vector<void*> memos_;
+
+  // This is only used when commands kCompressMatrix and kDecompressMatrix are
+  // invoked.  It will be (the first time we compress a matrix) resized to be
+  // the same size as 'matrices_' (i.e., indexed by matrix index).  When we
+  // compress a matrix m we set compressed_matrices_[m] to a non-NULL value and
+  // resize matrices_[m] to empty; and when we uncompress it, the reverse
+  // happens.
+  std::vector<CuCompressedMatrixBase*> compressed_matrices_;
 
 
   // executes the command in computation_.commands[program_counter_].
@@ -207,7 +316,6 @@ class NnetComputer {
   // memos are not reusable.
   inline void *GetMemo(int32 memo_index);
 
- private:
   NnetComputer &operator = (const NnetComputer &other);  // Disallow.
 };
 

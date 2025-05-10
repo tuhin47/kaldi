@@ -22,6 +22,8 @@
 #include "lat/push-lattice.h"
 #include "fstext/rand-fst.h"
 
+#include "fstext/openfst_compat.h"
+
 
 namespace kaldi {
 using namespace fst;
@@ -44,8 +46,8 @@ void TestPushCompactLatticeStrings() {
   for (CompactLatticeArc::StateId s = 0; s < clat2.NumStates(); s++) {
     if (s == 0)
       continue; // We don't check state zero, as the "leftover string" stays
-               // there.
-    int32 first_label;
+                // there.
+    int32 first_label = -1;
     bool ok = false;
     bool first_label_set = false;
     for (ArcIterator<CompactLattice> aiter(clat2, s); !aiter.Done();
@@ -92,12 +94,12 @@ void TestPushCompactLatticeWeights() {
       {
         fst::FstPrinter<CompactLatticeArc> printer(clat2, NULL, NULL,
                                                    NULL, true, true, "\t");
-        printer.Print(&std::cerr, "<unknown>");
+        printer_print(std::cerr, printer, "<unknown>");
       }
       {
         fst::FstPrinter<CompactLatticeArc> printer(*clat, NULL, NULL,
                                                    NULL, true, true, "\t");
-        printer.Print(&std::cerr, "<unknown>");
+        printer_print(std::cerr, printer, "<unknown>");
       }
       KALDI_ERR << "Bad lattice being pushed.";
     }

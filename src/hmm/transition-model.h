@@ -22,11 +22,13 @@
 #define KALDI_HMM_TRANSITION_MODEL_H_
 
 #include "base/kaldi-common.h"
-#include "tree/context-dep.h"
 #include "util/const-integer-set.h"
 #include "fst/fst-decl.h" // forward declarations.
 #include "hmm/hmm-topology.h"
 #include "itf/options-itf.h"
+#include "itf/context-dep-itf.h"
+#include "itf/transition-information.h"
+#include "matrix/kaldi-vector.h"
 
 namespace kaldi {
 
@@ -46,7 +48,7 @@ namespace kaldi {
 // this depends on the number of transitions/final-probs in the topology for
 // that (phone, HMM-state).  Each probability has an associated transition-index.
 // We associate with each (transition-state, transition-index) a unique transition-id.
-// Each individual probability estimated by the transition-model is asociated with a
+// Each individual probability estimated by the transition-model is associated with a
 // transition-id.
 //
 // List of the various types of quantity referred to here and what they mean:
@@ -119,7 +121,7 @@ struct MapTransitionUpdateConfig {
   }
 };
 
-class TransitionModel {
+class TransitionModel: public TransitionInformation {
 
  public:
   /// Initialize the object [e.g. at the start of training].
@@ -130,7 +132,7 @@ class TransitionModel {
 
 
   /// Constructor that takes no arguments: typically used prior to calling Read.
-  TransitionModel() { }
+  TransitionModel(): num_pdfs_(0) { }
 
   void Read(std::istream &is, bool binary);  // note, no symbol table: topo object always read/written w/o symbols.
   void Write(std::ostream &os, bool binary) const;
@@ -155,7 +157,14 @@ class TransitionModel {
   int32 SelfLoopOf(int32 trans_state) const;  // returns the self-loop transition-id, or zero if
   // this state doesn't have a self-loop.
 
-  inline int32 TransitionIdToPdf(int32 trans_id) const;
+  bool TransitionIdsEquivalent(int32_t trans_id1, int32_t trans_id2) const final;
+  bool TransitionIdIsStartOfPhone(int32_t trans_id) const final;
+
+  // TransitionIdToPdfFast is as TransitionIdToPdfArray()[trans_id] but skips an assertion
+  // (unless we're in paranoid mode).
+  inline int32 TransitionIdToPdfFast(int32 trans_id) const;
+  const std::vector<int32>& TransitionIdToPdfArray() const final;
+
   int32 TransitionIdToPhone(int32 trans_id) const;
   int32 TransitionIdToPdfClass(int32 trans_id) const;
   int32 TransitionIdToHmmState(int32 trans_id) const;
@@ -165,9 +174,6 @@ class TransitionModel {
   bool IsFinal(int32 trans_id) const;  // returns true if this trans_id goes to the final state
   // (which is bound to be nonemitting).
   bool IsSelfLoop(int32 trans_id) const;  // return true if this trans_id corresponds to a self-loop.
-
-  /// Returns the total number of transition-ids (note, these are one-based).
-  inline int32 NumTransitionIds() const { return id2state_.size()-1; }
 
   /// Returns the number of transition-indices for a particular transition-state.
   /// Note: "Indices" is the plural of "index".   Index is not the same as "id",
@@ -184,7 +190,7 @@ class TransitionModel {
   // an unseen phone has the highest-numbered pdf, this might be different.
   int32 NumPdfs() const { return num_pdfs_; }
 
-  // This loops over the triples and finds the highest phone index present. If
+  // This loops over the tuples and finds the highest phone index present. If
   // the FST symbol table for the phones is created in the expected way, i.e.:
   // starting from 1 (<eps> is 0) and numbered contiguously till the last phone,
   // this will be the total number of phones.
@@ -288,9 +294,9 @@ class TransitionModel {
 
   HmmTopology topo_;
 
-  /// Triples indexed by transition state minus one;
-  /// the triples are in sorted order which allows us to do the reverse mapping from
-  /// triple to transition state
+  /// Tuples indexed by transition state minus one;
+  /// the tuples are in sorted order which allows us to do the reverse mapping from
+  /// tuple to transition state
   std::vector<Tuple> tuples_;
 
   /// Gives the first transition_id of each transition-state; indexed by
@@ -316,14 +322,19 @@ class TransitionModel {
   /// of pdfs).
   int32 num_pdfs_;
 
-
   KALDI_DISALLOW_COPY_AND_ASSIGN(TransitionModel);
-
 };
 
-inline int32 TransitionModel::TransitionIdToPdf(int32 trans_id) const {
-  KALDI_ASSERT(static_cast<size_t>(trans_id) < id2pdf_id_.size() &&
-               "Likely graph/model mismatch (graph built from wrong model?)");
+inline int32 TransitionModel::TransitionIdToPdfFast(int32 trans_id) const {
+  // Note: it's a little dangerous to assert this only in paranoid mode.
+  // However, this function is called in the inner loop of decoders and
+  // the assertion likely takes a significant amount of time.  We make
+  // sure that past the end of the id2pdf_id_ array there are big
+  // numbers, which will make the calling code more likely to segfault
+  // (rather than silently die) if this is called for out-of-range values.
+  KALDI_PARANOID_ASSERT(
+      static_cast<size_t>(trans_id) < id2pdf_id_.size() &&
+      "Likely graph/model mismatch (graph built from wrong model?)");
   return id2pdf_id_[trans_id];
 }
 

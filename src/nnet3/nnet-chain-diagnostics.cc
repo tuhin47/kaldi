@@ -60,6 +60,7 @@ NnetChainComputeProb::NnetChainComputeProb(
     deriv_nnet_owned_(false),
     deriv_nnet_(nnet),
     num_minibatches_processed_(0) {
+  KALDI_ASSERT(den_graph_.NumPdfs() > 0);
   KALDI_ASSERT(nnet_config.store_component_stats && !nnet_config.compute_deriv);
 }
 
@@ -97,10 +98,13 @@ void NnetChainComputeProb::Compute(const NnetChainExample &chain_eg) {
   // regular objective.
   bool use_xent_regularization = (chain_config_.xent_regularize != 0.0),
       use_xent_derivative = false;
+
   GetChainComputationRequest(nnet_, chain_eg, need_model_derivative,
                              store_component_stats, use_xent_regularization,
                              use_xent_derivative, &request);
-  const NnetComputation *computation = compiler_.Compile(request);
+
+
+  std::shared_ptr<const NnetComputation> computation = compiler_.Compile(request);
   NnetComputer computer(nnet_config_.compute_config, *computation,
                         nnet_, deriv_nnet_);
   // give the inputs to the computer object.
@@ -115,6 +119,14 @@ void NnetChainComputeProb::ProcessOutputs(const NnetChainExample &eg,
                                          NnetComputer *computer) {
   // There will normally be just one output here, named 'output',
   // but the code is more general than this.
+  const NnetIo *lwf_io = NULL;
+  for (auto &io: eg.inputs) {
+    if (io.name == "__LWF-posteriors") {
+      lwf_io = &io;
+      break;
+    }
+  }
+
   std::vector<NnetChainSupervision>::const_iterator iter = eg.outputs.begin(),
       end = eg.outputs.end();
   for (; iter != end; ++iter) {
@@ -143,6 +155,39 @@ void NnetChainComputeProb::ProcessOutputs(const NnetChainExample &eg,
                              (nnet_config_.compute_deriv ? &nnet_output_deriv :
                               NULL), (use_xent ? &xent_deriv : NULL));
 
+    BaseFloat lwf_objf = 0;
+    if (lwf_io) {
+      CuMatrix<BaseFloat> nnet_output_exp(nnet_output);
+      nnet_output_exp.ApplyExp(); // Take it out of log-space
+      const GeneralMatrix &supervision = lwf_io->features;
+      Matrix<BaseFloat> sup_mat_bad_order;
+      supervision.GetMatrix(&sup_mat_bad_order);
+      Matrix<BaseFloat> sup_mat(sup_mat_bad_order.NumRows(),
+                                sup_mat_bad_order.NumCols(), kUndefined);
+      // Re-order it to make the order same as output
+      int32 frames_per_sequence = sup.supervision.frames_per_sequence,
+          num_sequences = sup.supervision.num_sequences;
+      for (int32 i = 0; i < sup_mat_bad_order.NumRows(); i++) {
+        int32 old_index = (i % num_sequences) * frames_per_sequence + i / num_sequences;
+        sup_mat.Row(i).CopyFromVec(sup_mat_bad_order.Row(old_index));
+      }
+
+      // one should be in non-log and the other in log-space:
+      CuMatrix<BaseFloat> cu_post(sup_mat);
+      CuMatrix<BaseFloat> cu_post_alt_space(cu_post);
+
+      bool post_is_in_logspace = !ApproxEqual(cu_post.Row(0).Sum(), 1.0, 0.1);
+      if (post_is_in_logspace) {
+        cu_post_alt_space.ApplyExp();
+      } else {
+        cu_post_alt_space.Add(1e-10);// avoid log(0)
+        cu_post_alt_space.ApplyLog();
+      }
+      CuMatrix<BaseFloat> *nonlog_space_post = post_is_in_logspace ? &cu_post_alt_space : &cu_post;
+      lwf_objf = TraceMatMat(nnet_output, *nonlog_space_post, kTrans);
+    } /// LWF
+
+
     // note: in this context we don't want to apply 'sup.deriv_weights' because
     // this code is used only in combination, where it's part of an L-BFGS
     // optimization algorithm, and in that case if there is a mismatch between
@@ -155,6 +200,7 @@ void NnetChainComputeProb::ProcessOutputs(const NnetChainExample &eg,
     totals.tot_weight += tot_weight;
     totals.tot_like += tot_like;
     totals.tot_l2_term += tot_l2_term;
+    totals.tot_lwf_term += lwf_objf;
 
     if (nnet_config_.compute_deriv)
       computer->AcceptInput(sup.name, &nnet_output_deriv);
@@ -200,6 +246,10 @@ bool NnetChainComputeProb::PrintTotalStats() const {
                 << like << " + " << l2_term << " = " << tot_objf << " per frame"
                 << ", over " << info.tot_weight << " frames.";
     }
+    if (info.tot_lwf_term != 0.0)
+      KALDI_LOG << "Total LWF is " << info.tot_lwf_term << " and "
+                << "it is " << info.tot_lwf_term / info.tot_weight
+                << " per frame.";
     if (info.tot_weight > 0)
       ans = true;
   }
@@ -217,15 +267,43 @@ const ChainObjectiveInfo* NnetChainComputeProb::GetObjective(
     return NULL;
 }
 
+double NnetChainComputeProb::GetTotalObjective(double *total_weight) const {
+  double tot_objectives = 0.0;
+  double tot_weight = 0.0;
+  unordered_map<std::string, ChainObjectiveInfo, StringHasher>::const_iterator
+    iter = objf_info_.begin(), end = objf_info_.end();
+  for (; iter != end; ++iter) {
+    tot_objectives += iter->second.tot_like + iter->second.tot_l2_term;
+    tot_weight += iter->second.tot_weight;
+  }
+
+  if (total_weight) *total_weight = tot_weight;
+  return tot_objectives;
+}
+
+static bool HasXentOutputs(const Nnet &nnet) {
+  const std::vector<std::string> node_names = nnet.GetNodeNames();
+  for (std::vector<std::string>::const_iterator it = node_names.begin();
+        it != node_names.end(); ++it) {
+    int32 node_index = nnet.GetNodeIndex(*it);
+    if (nnet.IsOutputNode(node_index) &&
+        it->find("-xent") != std::string::npos) {
+      return true;
+    }
+  }
+  return false;
+}
+
 void RecomputeStats(const std::vector<NnetChainExample> &egs,
                     const chain::ChainTrainingOptions &chain_config_in,
                     const fst::StdVectorFst &den_fst,
                     Nnet *nnet) {
   KALDI_LOG << "Recomputing stats on nnet (affects batch-norm)";
   chain::ChainTrainingOptions chain_config(chain_config_in);
-  if (nnet->GetNodeIndex("output-xent") != -1 &&
+  if (HasXentOutputs(*nnet) &&
       chain_config.xent_regularize == 0) {
-    // this forces it to compute the output for 'output-xent', which
+    // this forces it to compute the output for xent outputs,
+    // usually 'output-xent', which
     // means that we'll be computing batch-norm stats for any
     // components in that branch that have batch-norm.
     chain_config.xent_regularize = 0.1;
